@@ -3,6 +3,21 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Data never lives in the repo
+data/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.tif
+*.tiff
+*.csv
+*.xlsx
+
+# Python
+*.pyc
+*.egg-info/
+
 # C extensions
 *.so
 

@@ -13,6 +13,8 @@ data/
 *.tiff
 *.csv
 *.xlsx
+*.json
+*.jsonl
 
 # Python
 *.pyc

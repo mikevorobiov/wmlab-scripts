@@ -52,7 +52,7 @@ class FLIRCamera():
             self._cam.Init()
 
             # Assuming cam is an initialized PySpin Camera object
-            node_map = self._cam.GetNodeMap()
+            self.node_map = self._cam.GetNodeMap()
 
             # 1. Turn off Auto Exposure
             # exposure_auto = PySpin.CEnumerationPtr(node_map.GetNode('ExposureAuto'))
@@ -60,19 +60,19 @@ class FLIRCamera():
             self._cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
 
             # Set manual exposure time (in microseconds)
-            exposure_time = PySpin.CFloatPtr(node_map.GetNode('ExposureTime'))
+            exposure_time = PySpin.CFloatPtr(self.node_map.GetNode('ExposureTime'))
             exposure_time.SetValue(self._exposure_value) 
 
             # 2. Turn off Auto Gain
-            gain_auto = PySpin.CEnumerationPtr(node_map.GetNode('GainAuto'))
+            gain_auto = PySpin.CEnumerationPtr(self.node_map.GetNode('GainAuto'))
             gain_auto.SetIntValue(gain_auto.GetEntryByName('Off').GetValue())
 
             # Set manual gain (in dB)
-            gain = PySpin.CFloatPtr(node_map.GetNode('Gain'))
+            gain = PySpin.CFloatPtr(self.node_map.GetNode('Gain'))
             gain.SetValue(self._gain_value) # Example: 0 dB
 
             # 3. Disable Gamma
-            gamma_enable = PySpin.CBooleanPtr(node_map.GetNode('GammaEnable'))
+            gamma_enable = PySpin.CBooleanPtr(self.node_map.GetNode('GammaEnable'))
             gamma_enable.SetValue(False) # Set to False to disable, True to enable
 
             # 1. Enable Chunk Mode
@@ -85,6 +85,20 @@ class FLIRCamera():
             print('Camera initialized')
         except PySpin.SpinnakerException as ex:
             print(f'Error: {ex}')
+
+    def set_exposure_time(self, time_us: float):
+        assert time_us > 0.0
+        assert time_us < 100000000 # just some value ~100 sec. Check your model
+        exposure_time = PySpin.CFloatPtr(self.node_map.GetNode('ExposureTime'))
+        exposure_time.SetValue(time_us)
+        self._expposure_value = time_us 
+
+    def set_gain(self, gain_db: float = 15.0):
+        assert gain_db >= 0.0
+        assert gain_db < 100.0 # some large value -> look up yours in the camera datasheet
+        gain = PySpin.CFloatPtr(self.node_map.GetNode('Gain'))
+        gain.SetValue(gain_db) # Example: 0 dB
+        self._gain_value = gain_db
 
     @property
     def index(self) -> int:
@@ -175,7 +189,7 @@ class FLIRCamera():
     def get_frame(self):
        self.set_px_format_mono16bit()
        self._cam.BeginAcquisition()
-       image = self._cam.GetNextImage().getNDArray()
+       image = self._cam.GetNextImage().GetNDArray()
        image.Release()
        self.end_acqusition()
        return image

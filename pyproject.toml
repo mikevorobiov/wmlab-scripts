@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "labtools"
 version = "0.1"
 dependencies = [
-    numpy<2, scipy, matplotlib, PySpin
+    "numpy < 2", 
+    "scipy", 
+    "matplotlib"
 ]        # e.g. the camera SDK, numpy
 
 [tool.setuptools]

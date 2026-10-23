@@ -29,11 +29,12 @@ from labtools.flir import FLIRCamera
 
 #%%
 params = {
+    "frames_per_run": 2,
     "expousre_us": np.logspace(2, 4, 3),
     "gain_dB": np.linspace(0, 40, 5)
 }
 
-cam = FLIRCamera(cam_index=1)
+cam = FLIRCamera(cam_index=0)
 
 cam.set_px_format_mono16bit()
 pic = cam.get_frame()
@@ -41,3 +42,32 @@ cam.deinit()
 
 plt.figure(1)
 plt.imshow(pic)
+plt.show()
+# %%
+def acquire_calibration_data(params):
+    exposure = params["exposure_us"]
+    gain = params["gain_dB"]
+    N = params["frames_per_run"]    
+    
+    nx, ny = cam.resolution
+
+    raw_data = []
+    for g in gain:
+        cam.set_gain(g)
+        raw_data = {"gain_db": g}
+        for ex in exposure:
+            cam.set_exposure_time(ex)
+            img_sequence = cam.get_frame_sequence(10)
+            images_dict = {
+                "exposure_us": ex,
+                "images": img_sequence
+            }
+        raw_data.append({
+            "gain_db": g,
+            "exposure_data": images_dict
+        })
+    return raw_data
+
+def process_calibration_data(raw_data: dict):
+    pass
+

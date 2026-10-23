@@ -7,7 +7,7 @@ At one gain, the script sweeps the exposure log-spaced from --min-exposure to
 uniform illumination), then DARK (sensor covered).
 
 Choose --max-exposure so the brightest point just saturates. The script first
-grabs test frames at T, T/2 and T/4 and checks the ROI signal for linearity. That
+grabs test frames at T, T/2, T/4, T/8 and checks the ROI signal for linearity. That
 catches both ADC clipping and full well filling below 4095 DN, so you can adjust
 before committing to the run.
 
@@ -38,7 +38,7 @@ import numpy as np
 
 from labtools.flir import FLIRCamera
 from labtools.provenance import stamp
-from labtools.sensor import FULL_SCALE, clipped_mask, to_native
+from labtools.sensor import clipped_mask, full_scale, to_native
 
 LIGHT_SOURCE = ""      # e.g. "625 nm LED, 20 mA, opal diffuser"
 
@@ -81,8 +81,8 @@ def show_preview(frames: dict[str, np.ndarray], title: str) -> None:
         ys, xs = _roi(frame.shape)
         ax.add_patch(Rectangle((xs.start - 0.5, ys.start - 0.5), xs.stop - xs.start,
                                ys.stop - ys.start, fill=False, ec="cyan", lw=1.2))
-        ax.set_title(f"{label}\nROI mean {to_native(frame)[ys, xs].mean():.0f} DN "
-                     f"of {FULL_SCALE} (native 12-bit)", fontsize=9)
+        ax.set_title(f"{label}\nROI mean {to_native(frame)[ys, xs].mean():.0f} "
+                     f"of full scale {full_scale(frame):.0f} DN", fontsize=9)
         fig.colorbar(im, ax=ax, fraction=0.046, label="raw value")
     fig.suptitle(f"{title}   (cyan: analysis ROI, red: ADC clipped)  close window to continue",
                  fontsize=10)
@@ -95,27 +95,32 @@ def check_max_exposure(cam: FLIRCamera, max_exposure_us: float,
     """Is max_exposure just past saturation? Ideal: saturated at T but not at T/2.
 
     Saturation of either kind, ADC clipping or full well filling below 4095 DN,
-    makes the signal grow sublinearly with exposure. So the ROI mean is measured
-    at T, T/2 and T/4:
-      T/2 -> T   still linear  : not saturated at T           -> TOO SHORT
-      T/4 -> T/2 already sublinear : saturated already at T/2 -> TOO LONG
-      otherwise saturation sits between T/2 and T             -> OK
+    makes the signal grow sublinearly with exposure. The ROI mean m is measured at
+    T, T/2, T/4, T/8. The unknown dark offset cancels in successive differences
+    d1 = m(T) - m(T/2), d2 = m(T/2) - m(T/4), d3 = m(T/4) - m(T/8); for a linear
+    response each difference is twice the next one.
+      d1/d2 ~ 2 : still linear up to T          -> TOO SHORT
+      d2/d3 < 2 : already saturating below T/2  -> TOO LONG
+      otherwise saturation sits between T/2 and T -> OK
     """
-    ts = (max_exposure_us, max_exposure_us / 2, max_exposure_us / 4)
+    ts = tuple(max_exposure_us / 2**k for k in range(4))
     shots = [grab_roi(cam, t) for t in ts]
     m = [s[1] for s in shots]
-    r_top, r_mid = m[0] / m[1], m[1] / m[2]
-    if m[0] < 0.25 * FULL_SCALE or r_top > LINEAR_RATIO:
+    d = [m[k] - m[k + 1] for k in range(3)]
+    ratio = lambda a, b: a / b if b > 1.0 else 0.0      # b ~ 0: no growth left, i.e. saturated
+    r_top, r_mid = ratio(d[0], d[1]), ratio(d[1], d[2])
+    if r_top > LINEAR_RATIO or m[0] < 0.25 * full_scale(shots[0][0]):
         verdict = "TOO SHORT: still linear at the top; increase --max-exposure."
     elif r_mid < LINEAR_RATIO:
         verdict = "TOO LONG: saturated already at half of it; decrease --max-exposure."
     else:
         verdict = "OK"
     info = {"roi_mean_dn": m, "exposures_us": list(ts),
-            "ratio_T_over_half": r_top, "ratio_half_over_quarter": r_mid,
+            "ratio_top": r_top, "ratio_mid": r_mid,
             "clipped_fraction": [s[2] for s in shots]}
     if preview:
-        show_preview({f"{t:g} us ({100 * s[2]:.0f} % ROI clipped)": s[0] for t, s in zip(ts, shots)},
+        show_preview({f"{t:g} us ({100 * s[2]:.0f} % ROI clipped)": s[0]
+                      for t, s in zip(ts[:2], shots[:2])},
                      f"gain {cam.gain_value:.1f} dB: {verdict.split(':')[0]}")
     return info, verdict
 
@@ -157,9 +162,9 @@ def main(run_dir: pathlib.Path, gain_db: float, max_exposure_us: float,
         set_light(True)
         check, verdict = check_max_exposure(cam, max_exposure_us, preview)
         m = check["roi_mean_dn"]
-        print(f"{gain_db:g} dB, ROI mean at T, T/2, T/4 = {m[0]:.0f}, {m[1]:.0f}, {m[2]:.0f} DN "
-              f"(ratios {check['ratio_T_over_half']:.2f}, {check['ratio_half_over_quarter']:.2f}; "
-              f"linear = 2) -> {verdict}")
+        print(f"{gain_db:g} dB, ROI mean at T, T/2, T/4, T/8 = "
+              f"{', '.join(f'{x:.0f}' for x in m)} DN (growth ratios {check['ratio_top']:.2f}, "
+              f"{check['ratio_mid']:.2f}; linear = 2) -> {verdict}")
         if confirm and input("Start run? [y/N] ").strip().lower() != "y":
             print("Aborted, nothing written.")
             return

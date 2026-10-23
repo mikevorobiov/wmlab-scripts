@@ -54,7 +54,8 @@ SATURATED_FRACTION = 1e-3       # point counts as ADC-saturated above this ROI f
 
 def central_roi(ny: int, nx: int, fraction: float) -> tuple[slice, slice]:
     """Central region covering `fraction` of each dimension (avoids vignetting)."""
-    dy, dx = int(ny * fraction / 2), int(nx * fraction / 2)
+    dy = int(ny * fraction / 2) 
+    dx = int(nx * fraction / 2)
     return slice(ny // 2 - dy, ny // 2 + dy), slice(nx // 2 - dx, nx // 2 + dx)
 
 
@@ -67,17 +68,21 @@ def pixel_var(stack: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     and blinking pixels without biasing normal ones. The 1 DN^2 floor keeps the cut
     sane when the noise is below one code and the median is 0.
     """
-    s = stack - stack.mean(axis=(1, 2), keepdims=True)
-    v = s.var(axis=0, ddof=1)
-    return v, v > OUTLIER_FACTOR * max(float(np.median(v)), 1.0)
+    s = stack - stack.mean(axis=(1, 2), keepdims=True)  # remove mean from images
+    v = s.var(axis=0, ddof=1)   # calculate variance for each pixel
+    threshold = OUTLIER_FACTOR * max(float(np.median(v)), 1.0)  # threshold for hot pixels
+    vmask = v > threshold   # flag hot pixels with intensity exceeding threshold
+    return v, vmask 
 
 
 def temporal_var(stack: np.ndarray, bad: np.ndarray | None = None) -> tuple[float, float]:
     """Pixel-averaged temporal variance, excluding outliers and `bad` pixels.
     Returns (variance, fraction of pixels excluded)."""
-    v, out = pixel_var(stack)
+    v, out = pixel_var(stack) # get pixel temporal vairances and hot pixel mask
     if bad is not None:
         out = out | bad
+    # return mean variance of good pixels
+    # and mean variance of flagged bad pixels
     return float(v[~out].mean()), float(out.mean())
 
 
@@ -96,10 +101,11 @@ def ptc_point(light: np.ndarray, dark: np.ndarray, clip: float,
               bad: np.ndarray | None = None) -> dict:
     """One PTC point from float (frame, y, x) stacks already cut to the ROI."""
     n = light.shape[0]
-    offset = dark.mean()
-    signal = light.mean() - offset
-    var_total, out_light = temporal_var(light, bad)
-    var_read, out_dark = temporal_var(dark, bad)
+    offset = dark.mean() # calculate signal offset in dark
+    signal = light.mean() - offset # remove offset dark frame offset from light signal
+    var_total, out_light = temporal_var(light, bad) # calculate noise variance in light images + flag outliers
+    var_read, out_dark = temporal_var(dark, bad) # calculate noise variance in dark inamges + flag outliers
+    # 
     # spatial variance of the frame-averaged, dark-subtracted image, minus its temporal part
     flat = light.mean(axis=0) - dark.mean(axis=0)
     if bad is not None:

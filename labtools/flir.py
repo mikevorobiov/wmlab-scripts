@@ -13,8 +13,6 @@ from numpy.typing import NDArray
 
 import PySpin 
 
-from pinqued_tools.spectroscopy.spectrum import SpectralData, Axes2D
-
 class FLIRCamera():
     '''
     Class for FLIR camera data acquisition and control.
@@ -163,7 +161,26 @@ class FLIRCamera():
         self._cam.EndAcquisition()
         print('Acquisition ended')
 
-    def acquire_sequence(self, num_frames: int):
+    def get_metadata(self):
+        # Assemble metadata dictionary
+        metadata = {'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'Camera': self._cam_model,
+                    'Resolution': f'{self.resolution[0]}x{self.resolution[1]}',
+                    'FOV (mm)': f'{self._fov_horizontal}',
+                    'Exposure time (us)': f'{self._exposure_value}',
+                    'Gain (dB)': f'{self._gain_value}'
+                    }
+        return metadata
+
+    def get_frame(self):
+       self.set_px_format_mono16bit()
+       self._cam.BeginAcquisition()
+       image = self._cam.GetNextImage().getNDArray()
+       image.Release()
+       self.end_acqusition()
+       return image
+
+    def get_frame_sequence(self, num_frames: int):
         self.set_px_format_mono16bit()
 
         # 1. Enable chunk data
@@ -211,22 +228,13 @@ class FLIRCamera():
         time -= time[0]
         
         # Prepare data for return
-        # Assemble metadata dictionary
-        metadata = {'Date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'Camera': self._cam_model,
-                    'Resolution': f'{self.resolution[0]}x{self.resolution[1]}',
-                    'FOV (mm)': f'{self._fov_horizontal}',
-                    'Exposure time (us)': f'{self._exposure_value}',
-                    'Gain (dB)': f'{self._gain_value}'
-                    }
         # Create data container to return
-        data = SpectralData(signal=images,
-                            axes=Axes2D(f=time, 
-                                        x=np.linspace(0, self._fov_horizontal, self.resolution[0]),
-                                        y=np.linspace(0, self._fov_horizontal/self.aspect_ratio, self.resolution[1]),
-                                        units={'f':'us', 'x': 'mm', 'y': 'mm'}),
-                            units={'signal': 'counts'},
-                            metadata=metadata)
+        data = {
+            "images":   images,
+            "time_us":     time,
+            "x_mm":     np.linspace(0, self._fov_horizontal, self.resolution[0]),
+            "y_mm":     np.linspace(0, self._fov_horizontal/self.aspect_ratio, self.resolution[1]),
+        }
         return data
 
 

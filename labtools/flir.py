@@ -287,8 +287,13 @@ class FLIRCamera:
         return frame
 
     def get_frame_sequence(self, num_frames: int,
-                           timeout_ms: int | None = None) -> dict[str, NDArray]:
+                           timeout_ms: int | None = None,
+                           progress=None) -> dict[str, NDArray]:
         """Acquire num_frames frames in one stream.
+
+        progress : optional function called after every frame as
+                   progress(frames_done, num_frames), e.g. to draw a progress bar.
+                   Keep it quick: it runs between frames.
 
         Returns dict with
             images  : uint16 (frame, y, x)
@@ -305,6 +310,8 @@ class FLIRCamera:
         try:
             for i in range(num_frames):
                 _, t_ns[i] = self._grab(timeout_ms, out=images[i])
+                if progress is not None:
+                    progress(i + 1, num_frames)
         finally:
             self._end()
 

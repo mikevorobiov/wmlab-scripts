@@ -32,6 +32,19 @@ from numpy.typing import NDArray
 import PySpin
 
 
+class IncompleteImage(RuntimeError):
+    """A frame arrived damaged, e.g. with missing network packets (GigE).
+    Its own type, so callers can replace such a frame without hiding other errors."""
+
+
+def describe_image_status(status: int) -> str:
+    """Spinnaker's text for an image status code, falling back to the number."""
+    try:
+        return f"{PySpin.Image.GetImageStatusDescription(status)} (status {status})"
+    except Exception:
+        return f"status {status}"
+
+
 class FLIRCamera:
     """FLIR camera (Spinnaker / PySpin) for single-frame and sequence acquisition.
 
@@ -267,7 +280,8 @@ class FLIRCamera:
         image = self._cam.GetNextImage(timeout_ms)       # raises SpinnakerException on timeout
         try:
             if image.IsIncomplete():
-                raise RuntimeError(f"Incomplete image, status {image.GetImageStatus()}")
+                raise IncompleteImage(f"Incomplete image: "
+                                      f"{describe_image_status(image.GetImageStatus())}")
             arr = image.GetNDArray()                     # (y, x), view into driver buffer
             if out is None:
                 out = np.empty(arr.shape, dtype=arr.dtype)
@@ -288,16 +302,24 @@ class FLIRCamera:
 
     def get_frame_sequence(self, num_frames: int,
                            timeout_ms: int | None = None,
-                           progress=None) -> dict[str, NDArray]:
+                           progress=None,
+                           max_dropped: int = 0) -> dict[str, NDArray]:
         """Acquire num_frames frames in one stream.
 
-        progress : optional function called after every frame as
-                   progress(frames_done, num_frames), e.g. to draw a progress bar.
-                   Keep it quick: it runs between frames.
+        progress    : optional function called after every frame as
+                      progress(frames_done, num_frames), e.g. to draw a progress bar.
+                      Keep it quick: it runs between frames.
+        max_dropped : how many damaged (incomplete) frames may be thrown away and
+                      replaced by the next frame in the stream. The default 0
+                      raises at the first one. Allow a few for stacks of
+                      equivalent frames (flats, darks). Keep 0 when every frame
+                      matters, e.g. a time series.
 
         Returns dict with
             images  : uint16 (frame, y, x)
             time_us : float64, camera timestamps relative to the first frame
+                      (a replaced frame shows up as a longer gap)
+            dropped : number of damaged frames that were replaced
             x_mm, y_mm : pixel coordinates
         """
         if num_frames < 1:
@@ -306,18 +328,30 @@ class FLIRCamera:
         images = np.empty((num_frames, h, w), dtype=np.uint16)
         t_ns = np.empty(num_frames, dtype=np.int64)
 
+        collected = 0
+        dropped = 0
         self._begin()
         try:
-            for i in range(num_frames):
-                _, t_ns[i] = self._grab(timeout_ms, out=images[i])
+            while collected < num_frames:
+                try:
+                    _, t_ns[collected] = self._grab(timeout_ms, out=images[collected])
+                except IncompleteImage:
+                    # Damaged frame: count it, and grab the next one in its place.
+                    dropped += 1
+                    if dropped > max_dropped:
+                        raise
+                    continue
+
+                collected += 1
                 if progress is not None:
-                    progress(i + 1, num_frames)
+                    progress(collected, num_frames)
         finally:
             self._end()
 
         return {
             "images": images,
             "time_us": (t_ns - t_ns[0]) / 1e3,
+            "dropped": dropped,
             "x_mm": self.x_mm,
             "y_mm": self.y_mm,
         }

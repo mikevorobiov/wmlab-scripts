@@ -21,8 +21,7 @@ Also saved:
                  after averaging. Propagate it like any other uncertainty.
     bad_pixels   pixels the flat cannot be trusted for (see below)
 
-Bad pixels (MAD test: robust z-score > Z_LIMIT; the MAD is the median
-absolute deviation, which outliers cannot inflate):
+Bad pixels
     hot     average dark level far above the rest
     noisy   frame-to-frame scatter in the darks far above the rest
     odd     response far from its NEIGHBOURS: flat divided by a median-
@@ -31,6 +30,25 @@ absolute deviation, which outliers cannot inflate):
             shadows can land here too; that is on the safe side.
 A pixel can fall into more than one group (a blinking pixel also raises its
 average dark level, so it is usually "hot" as well); n_bad counts it once.
+
+How "far" is decided: a pixel is flagged only if its deviation from the median
+is BOTH
+  - more than Z_LIMIT robust sigmas, where robust sigma = 1.4826 x MAD
+    (median absolute deviation, which the outliers themselves cannot inflate),
+    but never less than what the ADC can resolve, and
+  - more than a physical minimum, a few ADC codes (hot, noisy tests).
+
+Why the floor: when the read noise is below one ADC code (low gain), most dark
+pixels read the same code in every frame. Their scatter is then 0 and the MAD
+is close to 0, so without a floor almost every pixel would look like an
+outlier. One code is 16 raw DN when the camera left-shifts its 12-bit values.
+A frame cannot resolve better than step/sqrt(12); an average of N frames not
+better than step/sqrt(12 N).
+
+Why the MAD is valid for these three quantities (unlike per-pixel variances
+from only two frames, which are strongly skewed): an average over ~100 frames,
+a standard deviation over ~100 frames, and a ratio near 1 are all close to
+Gaussian across pixels, apart from the outliers being looked for.
 
 PRNU (pixel response non-uniformity) is reported from the same high-pass
 image: the spread of flat / smoothed flat over the good pixels. Smooth
@@ -49,27 +67,47 @@ from scipy.ndimage import median_filter
 
 from labtools.data_io import load, save_h5
 from labtools.provenance import file_ref, stamp
+from labtools.sensor import lsb_shift
 
 SMOOTH_PIXELS = 15      # median-filter size for the "neighbours" comparison
 Z_LIMIT = 5.0           # robust z-score above which a pixel is called bad
+HOT_MIN_CODES = 3       # a hot pixel's dark level is at least this many codes high
+NOISY_MIN_CODES = 2     # a noisy pixel's dark scatter is at least this many codes
 
 
 # --------------------------------------------------------------------------- #
 # Statistics helpers
 # --------------------------------------------------------------------------- #
 
-def robust_z(values: np.ndarray) -> np.ndarray:
-    """How many robust standard deviations each value is from the median.
+def robust_sigma(values: np.ndarray, resolution: float) -> float:
+    """Standard deviation estimated from the MAD, but never below `resolution`.
 
-    1.4826 * MAD equals the standard deviation for Gaussian data, but a few
-    extreme values (the very pixels we look for) barely change it.
+    1.4826 * MAD equals the standard deviation for Gaussian data, and a few
+    extreme values (the very pixels we look for) barely change it. The floor
+    stops quantized data, where the MAD can be ~0, from making every small
+    difference look enormous.
     """
     median = np.median(values)
     mad = np.median(np.abs(values - median))
-    robust_sigma = 1.4826 * mad
-    if robust_sigma == 0:
-        raise ValueError("All values identical: cannot judge outliers")
-    return (values - median) / robust_sigma
+    return max(1.4826 * mad, resolution)
+
+
+def flag_high(values: np.ndarray, resolution: float, minimum: float, z_limit: float) -> np.ndarray:
+    """True where a value is above the median by more than z_limit robust
+    sigmas AND by more than `minimum`."""
+    excess = values - np.median(values)
+    sigma = robust_sigma(values, resolution)
+    is_statistical_outlier = excess > z_limit * sigma
+    is_large_enough = excess > minimum
+    return is_statistical_outlier & is_large_enough
+
+
+def flag_either_side(values: np.ndarray, resolution: float, z_limit: float) -> np.ndarray:
+    """True where a value is more than z_limit robust sigmas from the median,
+    above or below."""
+    deviation = np.abs(values - np.median(values))
+    sigma = robust_sigma(values, resolution)
+    return deviation > z_limit * sigma
 
 
 def average_and_scatter(stack: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -104,9 +142,20 @@ def build_flat(light: np.ndarray, dark: np.ndarray,
     smoothed = median_filter(signal, size=smooth_pixels, mode="nearest")
     neighbour_ratio = signal / smoothed
 
-    hot = robust_z(dark_mean) > z_limit
-    noisy = robust_z(dark_std) > z_limit
-    odd = np.abs(robust_z(neighbour_ratio)) > z_limit
+    # Smallest step the ADC can make, in raw DN: 16 if the camera left-shifts
+    # its 12-bit codes into Mono16, otherwise 1.
+    step = 2 ** lsb_shift(dark)
+
+    # Finest detail each quantity can resolve (see the module docstring)
+    resolution_of_single_frame = step / np.sqrt(12)
+    resolution_of_dark_mean = resolution_of_single_frame / np.sqrt(n_dark)
+    resolution_of_ratio = resolution_of_single_frame / np.sqrt(n_light) / np.median(signal)
+
+    hot = flag_high(dark_mean, resolution_of_dark_mean,
+                    minimum=HOT_MIN_CODES * step, z_limit=z_limit)
+    noisy = flag_high(dark_std, resolution_of_single_frame,
+                      minimum=NOISY_MIN_CODES * step, z_limit=z_limit)
+    odd = flag_either_side(neighbour_ratio, resolution_of_ratio, z_limit=z_limit)
     bad = hot | noisy | odd
 
     # Normalise to mean 1 over the good pixels
@@ -142,6 +191,7 @@ def build_flat(light: np.ndarray, dark: np.ndarray,
             "n_bad": int(bad.sum()),
             "n_light_frames": n_light,
             "n_dark_frames": n_dark,
+            "adc_step_dn": int(step),
         },
     }
 
@@ -238,7 +288,7 @@ def main(out_dir: pathlib.Path, raw_dir: pathlib.Path,
               f"flat noise {100 * s['median_flat_error']:.2f} %,  "
               f"vignetting {s['vignetting_min']:.2f}..{s['vignetting_max']:.2f},  "
               f"bad pixels {s['n_bad']} (hot {s['n_hot']}, noisy {s['n_noisy']}, "
-              f"odd {s['n_odd']})")
+              f"odd {s['n_odd']}),  ADC step {s['adc_step_dn']} DN")
         if s["median_flat_error"] > 0.3 * s["prnu"]:
             print("        NOTE: flat noise is not small compared with the PRNU; "
                   "more frames would make this flat cleaner")

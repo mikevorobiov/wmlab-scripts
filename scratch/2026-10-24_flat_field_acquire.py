@@ -74,7 +74,7 @@ from labtools.find_flat_exposure import find_flat_exposure
 from labtools.flir import FLIRCamera
 from labtools.provenance import stamp
 
-LIGHT_SOURCE = ""      # e.g. "625 nm LED, 20 mA, opal diffuser at the lens"
+LIGHT_SOURCE = "Barrina T5 LED lamps"      # e.g. "625 nm LED, 20 mA, opal diffuser at the lens"
 
 
 def record_stack(cam: FLIRCamera, gain_db: float, exposure_us: float, n_frames: int):

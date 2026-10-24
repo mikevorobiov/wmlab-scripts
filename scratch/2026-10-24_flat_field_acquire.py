@@ -1,3 +1,4 @@
+
 """
 Author: Mykhailo Vorobiov
 Date: 2026-10-24
@@ -51,16 +52,24 @@ Procedure
   2. Show the exposures found and ask to continue.
   3. LIGHT phase: record --frames lit frames at each gain.
   4. One prompt to cover the lens.
-  5. DARK phase: record the same number of frames at each gain and exposure,
-     then save that gain's lit and dark stacks to flat_<gain>dB.h5.
+  5. DARK phase: record the same number of frames at each gain and exposure.
+  Every stack is saved the moment it is recorded, so a failure later in the
+  run loses only the stack in progress.
+
+Damaged frames
+    On GigE a frame occasionally arrives with missing network packets. Up to
+    MAX_DROPPED_FRAMES such frames per stack are thrown away and replaced by
+    the next frame; flats and darks are equivalent frames, so nothing is lost.
+    The number replaced is printed and stored with the stack.
 
 Usage:
     python acquire/flat_acquire_gains.py <run_dir> --gains 0 10 20 34
     options: --frames 50  --target 0.7  --cam 1  --fov 11.5
 
-Output, one file per gain, e.g. <run_dir>/flat_34.0dB.h5:
-    /light, /dark      uint16 (frame, y, x), raw Mono16 values
-    attrs              gain and exposure actually used, target level
+Output, two files per gain, e.g. for 34 dB:
+    <run_dir>/light_34.0dB.h5    /light  uint16 (frame, y, x), raw Mono16
+    <run_dir>/dark_34.0dB.h5     /dark   uint16 (frame, y, x), raw Mono16
+    attrs: gain and exposure actually used, target level, frames replaced
 plus the usual provenance record.
 """
 
@@ -81,6 +90,10 @@ LIGHT_SOURCE = ""      # e.g. "625 nm LED, 20 mA, opal diffuser at the lens"
 # Only used for the estimate shown BEFORE recording; the progress bar measures
 # the real rate while recording. ~5 ms suits the BFS-PGE-04S2M (about 290 fps).
 READOUT_S_PER_FRAME = 0.005
+
+# Damaged frames (missing GigE packets) replaced per stack before giving up.
+# A handful is harmless; many more points to a network problem worth fixing.
+MAX_DROPPED_FRAMES = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -155,17 +168,27 @@ def estimate_duration(exposures_us, n_frames: int) -> float:
 # --------------------------------------------------------------------------- #
 
 def record_stack(cam: FLIRCamera, gain_db: float, exposure_us: float,
-                 n_frames: int, label: str):
+                 n_frames: int, label: str) -> dict:
     """Set gain and exposure, record n_frames in one stream with a progress bar.
 
-    Returns (images, gain actually used, exposure actually used). The camera
-    rounds both settings, so the values read back are the ones to store.
+    Returns a dict with the images, the gain and exposure actually used (the
+    camera rounds both, so the values read back are the ones to store), and
+    how many damaged frames were replaced.
     """
     cam.set_gain(gain_db)
     cam.set_exposure_time(exposure_us)
     progress_bar = ProgressBar(label)
-    images = cam.get_frame_sequence(n_frames, progress=progress_bar)["images"]
-    return images, cam.gain_value, cam.exposure_value
+    sequence = cam.get_frame_sequence(n_frames, progress=progress_bar,
+                                      max_dropped=MAX_DROPPED_FRAMES)
+    if sequence["dropped"] > 0:
+        print(f"        replaced {sequence['dropped']} damaged frame(s)")
+
+    return {
+        "images": sequence["images"],
+        "gain_used": cam.gain_value,
+        "exposure_used": cam.exposure_value,
+        "dropped": sequence["dropped"],
+    }
 
 
 def residual_flat_noise(light: np.ndarray) -> float:
@@ -187,22 +210,24 @@ def residual_flat_noise(light: np.ndarray) -> float:
     return float(np.median(relative_noise))
 
 
-def save_gain(run_dir: pathlib.Path, entry: dict, dark: np.ndarray, target: float) -> pathlib.Path:
-    """Write one gain's lit and dark stacks, with the settings actually used."""
-    path = run_dir / f"flat_{entry['gain_requested']:04.1f}dB.h5"      # e.g. flat_34.0dB.h5
+def save_stack(run_dir: pathlib.Path, kind: str, gain_requested: float,
+               stack: dict, target: float) -> pathlib.Path:
+    """Write one stack straight away, e.g. light_34.0dB.h5 holding /light.
+
+    kind is "light" or "dark"; it names both the file and the dataset.
+    """
+    path = run_dir / f"{kind}_{gain_requested:04.1f}dB.h5"
     save_h5(path, {
-        "light": entry["light"],
-        "dark": dark,
+        kind: stack["images"],
         "attrs": {
-            "gain_db": entry["gain_used"],
-            "gain_db_requested": entry["gain_requested"],
-            "exposure_us": entry["exposure_used"],
+            "gain_db": stack["gain_used"],
+            "gain_db_requested": gain_requested,
+            "exposure_us": stack["exposure_used"],
+            "dropped_frames_replaced": stack["dropped"],
             "target_level": target,
             "light_source": LIGHT_SOURCE,
-            "light.axes": "frame, y, x",
-            "dark.axes": "frame, y, x",
-            "light.units": "raw DN (Mono16)",
-            "dark.units": "raw DN (Mono16)",
+            f"{kind}.axes": "frame, y, x",
+            f"{kind}.units": "raw DN (Mono16)",
         },
     })
     return path
@@ -214,12 +239,11 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
     with FLIRCamera(cam_index=cam_index, fov_horizontal=fov_mm) as cam:
         cam.disable_fps_limit()           # otherwise long exposures are refused
 
-        # Lit and dark stacks of all gains are held in memory until the dark
-        # phase is done. Say how much that is before starting.
+        # Only one stack is in memory at a time; each is saved when recorded.
         width, height = cam.resolution
-        megabytes = len(gains_db) * 2 * n_frames * width * height * 2 / 1e6
-        print(f"{len(gains_db)} gains x {n_frames} frames x (light + dark): "
-              f"about {megabytes:.0f} MB in memory")
+        megabytes_per_stack = n_frames * width * height * 2 / 1e6
+        print(f"{len(gains_db)} gains x {n_frames} frames x (light + dark), "
+              f"{megabytes_per_stack:.0f} MB per stack")
 
         # 1. Find the exposures. Nothing is written to disk yet, so a failure
         #    here (light off, source too bright) leaves no half-finished run.
@@ -249,23 +273,25 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
             "camera": cam.get_metadata(),
         })
 
-        # 3. LIGHT phase: every gain, one after the other.
+        # 3. LIGHT phase: every gain, one after the other, saved at once.
         print("\nStep 2/3: recording lit frames")
         light_phase_start = time.perf_counter()
-        recorded = []
+        settings_used = []            # what the darks must match, one entry per gain
         n_gains = len(gains_db)
 
         for number, (gain, exposure) in enumerate(zip(gains_db, exposures), start=1):
             label = f"[{number}/{n_gains}] light {gain:5.1f} dB"
-            light, gain_used, exposure_used = record_stack(cam, gain, exposure, n_frames, label)
-            noise = residual_flat_noise(light)
-            print(f"        averaged flat noise {100 * noise:.2f} % per pixel")
-            recorded.append({
+            light = record_stack(cam, gain, exposure, n_frames, label)
+            path = save_stack(run_dir, "light", gain, light, target)
+
+            noise = residual_flat_noise(light["images"])
+            print(f"        averaged flat noise {100 * noise:.2f} % per pixel, saved {path.name}")
+            settings_used.append({
                 "gain_requested": gain,
-                "gain_used": gain_used,
-                "exposure_used": exposure_used,
-                "light": light,
+                "gain_used": light["gain_used"],
+                "exposure_used": light["exposure_used"],
             })
+            del light                 # free the memory before the next stack
 
         # 4. One prompt for all darks. The dark phase uses the same settings,
         #    so it takes about as long as the light phase just did.
@@ -274,22 +300,23 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
               f"the dark phase will take about the same.")
         input("DARK: cover the lens completely, then press Enter ")
 
-        # 5. DARK phase: same gain and exposure as each lit stack, then save.
-        print("\nStep 3/3: recording dark frames and saving")
-        for number, entry in enumerate(recorded, start=1):
+        # 5. DARK phase: same gain and exposure as each lit stack, saved at once.
+        print("\nStep 3/3: recording dark frames")
+        for number, entry in enumerate(settings_used, start=1):
             label = f"[{number}/{n_gains}] dark  {entry['gain_requested']:5.1f} dB"
-            dark, gain_used, exposure_used = record_stack(
-                cam, entry["gain_requested"], entry["exposure_used"], n_frames, label)
+            dark = record_stack(cam, entry["gain_requested"], entry["exposure_used"],
+                                n_frames, label)
 
             # Dark and light must have identical settings, or the dark does not
             # describe the same offset. Fail loudly rather than save a mismatch.
-            same_gain = np.isclose(gain_used, entry["gain_used"])
-            same_exposure = np.isclose(exposure_used, entry["exposure_used"])
+            same_gain = np.isclose(dark["gain_used"], entry["gain_used"])
+            same_exposure = np.isclose(dark["exposure_used"], entry["exposure_used"])
             if not (same_gain and same_exposure):
                 raise RuntimeError(f"Dark settings differ from light at {entry['gain_requested']} dB")
 
-            path = save_gain(run_dir, entry, dark, target)
+            path = save_stack(run_dir, "dark", entry["gain_requested"], dark, target)
             print(f"        saved {path.name}")
+            del dark
 
     print(f"\nDone: {run_dir}")
 

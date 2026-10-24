@@ -194,6 +194,13 @@ class FLIRCamera:
         return self._cam.ExposureTime.GetValue()
 
     @property
+    def exposure_range_us(self) -> tuple[float, float]:
+        """(min, max) exposure the camera allows right now, in microseconds.
+        The max depends on the frame-rate limit; see disable_fps_limit()."""
+        node = self._cam.ExposureTime
+        return node.GetMin(), node.GetMax()
+
+    @property
     def gain_value(self) -> float:
         """Actual gain in dB, as set on the camera."""
         return self._cam.Gain.GetValue()

@@ -66,6 +66,7 @@ plus the usual provenance record.
 
 import argparse
 import pathlib
+import time
 
 import numpy as np
 
@@ -74,18 +75,96 @@ from labtools.find_flat_exposure import find_flat_exposure
 from labtools.flir import FLIRCamera
 from labtools.provenance import stamp
 
-LIGHT_SOURCE = "Barrina T5 LED lamps"      # e.g. "625 nm LED, 20 mA, opal diffuser at the lens"
+LIGHT_SOURCE = ""      # e.g. "625 nm LED, 20 mA, opal diffuser at the lens"
+
+# Rough time per frame on top of the exposure itself (readout and transfer).
+# Only used for the estimate shown BEFORE recording; the progress bar measures
+# the real rate while recording. ~5 ms suits the BFS-PGE-04S2M (about 290 fps).
+READOUT_S_PER_FRAME = 0.005
 
 
-def record_stack(cam: FLIRCamera, gain_db: float, exposure_us: float, n_frames: int):
-    """Set gain and exposure, record n_frames in one stream.
+# --------------------------------------------------------------------------- #
+# Progress and time estimates
+# --------------------------------------------------------------------------- #
+
+def format_duration(seconds: float) -> str:
+    """42.0 -> '42 s',  185 -> '3 min 05 s'."""
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    minutes, seconds = divmod(round(seconds), 60)
+    return f"{minutes} min {seconds:02d} s"
+
+
+class ProgressBar:
+    """One-line progress bar with the time left, redrawn in place:
+
+        [2/4] light 20.0 dB [###########---------]   25/50  3 s left
+
+    The driver calls it after every frame, as progress(frames_done, total),
+    when passed to get_frame_sequence(..., progress=bar).
+
+    Time left = average time per frame x frames still to come. The average is
+    measured from the FIRST frame on, not from the start, because the first
+    frame also carries the stream start-up and would inflate the estimate.
+    """
+    WIDTH = 30          # characters in the bar
+
+    def __init__(self, label: str):
+        self.label = label
+        self.start = time.perf_counter()
+        self.first_frame_time = None
+
+    def __call__(self, done: int, total: int) -> None:
+        now = time.perf_counter()
+        elapsed = now - self.start
+
+        if done == 1:
+            self.first_frame_time = now
+
+        filled = int(self.WIDTH * done / total)
+        bar = "#" * filled + "-" * (self.WIDTH - filled)
+
+        if done == total:
+            status = f"done in {format_duration(elapsed)}"
+            line_end = "\n"                     # finished: move to the next line
+        elif done == 1:
+            status = "estimating..."            # one frame gives no rate yet
+            line_end = ""
+        else:
+            seconds_per_frame = (now - self.first_frame_time) / (done - 1)
+            time_left = seconds_per_frame * (total - done)
+            status = f"{format_duration(time_left)} left"
+            line_end = ""                       # stay on this line, redraw next time
+
+        # "\r" returns to the start of the line, so each call overwrites the last.
+        print(f"\r  {self.label} [{bar}] {done:4d}/{total}  {status:<16}",
+              end=line_end, flush=True)
+
+
+def estimate_duration(exposures_us, n_frames: int) -> float:
+    """Rough seconds to record light AND dark stacks for all gains."""
+    seconds_per_stack = 0.0
+    for exposure_us in exposures_us:
+        seconds_per_frame = exposure_us / 1e6 + READOUT_S_PER_FRAME
+        seconds_per_stack += n_frames * seconds_per_frame
+    return 2 * seconds_per_stack                # light phase + dark phase
+
+
+# --------------------------------------------------------------------------- #
+# Recording and saving
+# --------------------------------------------------------------------------- #
+
+def record_stack(cam: FLIRCamera, gain_db: float, exposure_us: float,
+                 n_frames: int, label: str):
+    """Set gain and exposure, record n_frames in one stream with a progress bar.
 
     Returns (images, gain actually used, exposure actually used). The camera
     rounds both settings, so the values read back are the ones to store.
     """
     cam.set_gain(gain_db)
     cam.set_exposure_time(exposure_us)
-    images = cam.get_frame_sequence(n_frames)["images"]
+    progress_bar = ProgressBar(label)
+    images = cam.get_frame_sequence(n_frames, progress=progress_bar)["images"]
     return images, cam.gain_value, cam.exposure_value
 
 
@@ -145,12 +224,16 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
         # 1. Find the exposures. Nothing is written to disk yet, so a failure
         #    here (light off, source too bright) leaves no half-finished run.
         input("LIGHT: switch the source on and uncover the lens, then press Enter ")
+        print("\nStep 1/3: finding the exposure for each gain")
         exposures = find_flat_exposure(cam, gains_db, target=target)
 
-        # 2. Show what was found and ask before recording.
+        # 2. Show what was found, how long recording will take, and ask.
         print("\n   gain [dB]   exposure [us]")
         for gain, exposure in zip(gains_db, exposures):
             print(f"   {gain:9.1f}   {exposure:13.1f}")
+        estimate = estimate_duration(exposures, n_frames)
+        print(f"\nRecording will take roughly {format_duration(estimate)} "
+              "(light and dark together, plus the time to cover the lens).")
         if input("Record flats with these settings? [y/N] ").strip().lower() != "y":
             print("Aborted, nothing written.")
             return
@@ -167,12 +250,16 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
         })
 
         # 3. LIGHT phase: every gain, one after the other.
+        print("\nStep 2/3: recording lit frames")
+        light_phase_start = time.perf_counter()
         recorded = []
-        for gain, exposure in zip(gains_db, exposures):
-            light, gain_used, exposure_used = record_stack(cam, gain, exposure, n_frames)
+        n_gains = len(gains_db)
+
+        for number, (gain, exposure) in enumerate(zip(gains_db, exposures), start=1):
+            label = f"[{number}/{n_gains}] light {gain:5.1f} dB"
+            light, gain_used, exposure_used = record_stack(cam, gain, exposure, n_frames, label)
             noise = residual_flat_noise(light)
-            print(f"  light {gain:5.1f} dB: {n_frames} frames, "
-                  f"averaged flat noise {100 * noise:.2f} % per pixel")
+            print(f"        averaged flat noise {100 * noise:.2f} % per pixel")
             recorded.append({
                 "gain_requested": gain,
                 "gain_used": gain_used,
@@ -180,13 +267,19 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
                 "light": light,
             })
 
-        # 4. One prompt for all darks.
-        input("\nDARK: cover the lens completely, then press Enter ")
+        # 4. One prompt for all darks. The dark phase uses the same settings,
+        #    so it takes about as long as the light phase just did.
+        light_phase_duration = time.perf_counter() - light_phase_start
+        print(f"\nLight phase took {format_duration(light_phase_duration)}; "
+              f"the dark phase will take about the same.")
+        input("DARK: cover the lens completely, then press Enter ")
 
         # 5. DARK phase: same gain and exposure as each lit stack, then save.
-        for entry in recorded:
+        print("\nStep 3/3: recording dark frames and saving")
+        for number, entry in enumerate(recorded, start=1):
+            label = f"[{number}/{n_gains}] dark  {entry['gain_requested']:5.1f} dB"
             dark, gain_used, exposure_used = record_stack(
-                cam, entry["gain_requested"], entry["exposure_used"], n_frames)
+                cam, entry["gain_requested"], entry["exposure_used"], n_frames, label)
 
             # Dark and light must have identical settings, or the dark does not
             # describe the same offset. Fail loudly rather than save a mismatch.
@@ -196,7 +289,7 @@ def main(run_dir: pathlib.Path, gains_db: list[float], n_frames: int = 50,
                 raise RuntimeError(f"Dark settings differ from light at {entry['gain_requested']} dB")
 
             path = save_gain(run_dir, entry, dark, target)
-            print(f"  dark  {entry['gain_requested']:5.1f} dB: saved {path.name}")
+            print(f"        saved {path.name}")
 
     print(f"\nDone: {run_dir}")
 

@@ -334,6 +334,8 @@ class FLIRCamera:
                       (a replaced frame shows up as a longer gap)
             dropped : number of damaged frames that were replaced
             x_mm, y_mm : pixel coordinates
+            temperature_before_c : camera temperature before acquisition
+            temperature_after_c : camera temperature after acquisition
         """
         if num_frames < 1:
             raise ValueError("num_frames must be >= 1")

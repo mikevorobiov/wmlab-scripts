@@ -219,6 +219,19 @@ class FLIRCamera:
         return self._cam.Gain.GetValue()
 
     @property
+    def temperature_c(self) -> float:
+        """Device temperature in degrees C, or None if the camera does not report one.
+
+        Read from the GenICam node DeviceTemperature. Which sensor it measures
+        (sensor die or main board) depends on the model; check SpinView. Dark
+        current roughly doubles every 6-8 C, so record it with every dark set.
+        """
+        node = getattr(self._cam, "DeviceTemperature", None)
+        if node is None or not PySpin.IsReadable(node):
+            return float("nan")
+        return node.GetValue()
+
+    @property
     def camera_model(self) -> str:
         return self._cam.TLDevice.DeviceModelName.GetValue()
 
@@ -303,7 +316,7 @@ class FLIRCamera:
     def get_frame_sequence(self, num_frames: int,
                            timeout_ms: int | None = None,
                            progress=None,
-                           max_dropped: int = 0) -> dict[str, NDArray]:
+                           max_dropped: int = 0) -> dict:
         """Acquire num_frames frames in one stream.
 
         progress    : optional function called after every frame as
@@ -330,6 +343,7 @@ class FLIRCamera:
 
         collected = 0
         dropped = 0
+        temperature_before = self.temperature_c
         self._begin()
         try:
             while collected < num_frames:
@@ -347,6 +361,7 @@ class FLIRCamera:
                     progress(collected, num_frames)
         finally:
             self._end()
+        temperature_after = self.temperature_c
 
         return {
             "images": images,
@@ -354,6 +369,8 @@ class FLIRCamera:
             "dropped": dropped,
             "x_mm": self.x_mm,
             "y_mm": self.y_mm,
+            "temperature_before_c": temperature_before,
+            "temperature_after_c": temperature_after,
         }
 
     # ------------------------------------------------------------------ #

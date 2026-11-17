@@ -44,6 +44,7 @@ def describe_image_status(status: int) -> str:
     except Exception:
         return f"status {status}"
 
+BLACK_LEVEL_PERCENT = 2.0     # fixed offset; high enough that dark noise is not clipped at 0
 
 class FLIRCamera:
     """FLIR camera (Spinnaker / PySpin) for single-frame and sequence acquisition.
@@ -119,6 +120,29 @@ class FLIRCamera:
         cam.ChunkModeActive.SetValue(True)
         cam.ChunkSelector.SetValue(PySpin.ChunkSelector_Timestamp)
         cam.ChunkEnable.SetValue(True)
+        self.set_fixed_black_level(BLACK_LEVEL_PERCENT)
+
+    def set_fixed_black_level(self, percent: float) -> None:
+        """Turn off automatic black-level clamping and set a fixed offset.
+
+        With clamping on, the camera keeps re-adjusting the offset from its
+        optically black pixels. Near a decision boundary it toggles between two
+        settings, which shifts the whole frame by a fixed step at random times.
+        A fixed offset is stable frame to frame; drift with temperature is
+        handled by taking darks under the same conditions as the data.
+        """
+        cam = self._cam
+
+        # Clamping first: while it is on, it may override the black level.
+        if PySpin.IsWritable(cam.BlackLevelClampingEnable):
+            cam.BlackLevelClampingEnable.SetValue(False)
+        else:
+            print("warning: black-level clamping cannot be switched off on this camera")
+
+        # Only the total ("All") black level is user-writable.
+        if PySpin.IsWritable(cam.BlackLevelSelector):
+            cam.BlackLevelSelector.SetValue(PySpin.BlackLevelSelector_All)
+        cam.BlackLevel.SetValue(percent)
 
     def set_px_format_mono16bit(self) -> None:
         """12-bit ADC, Mono16 pixel format. Only valid while not streaming."""
@@ -267,6 +291,9 @@ class FLIRCamera:
             "pixel_format": self._cam.PixelFormat.GetCurrentEntry().GetSymbolic(),
             "adc_bit_depth": self._cam.AdcBitDepth.GetCurrentEntry().GetSymbolic(),
             "trigger": self._trigger_wait_ms > 0,
+            "temperature_c": self.temperature_c,
+            "black_level_percent": self._cam.BlackLevel.GetValue(),
+            "black_level_clamping": self._cam.BlackLevelClampingEnable.GetValue(),
         }
 
     # ------------------------------------------------------------------ #

@@ -167,7 +167,7 @@ class FLIRCamera:
             raise ValueError(f"gain {gain_db} dB outside camera range [{lo:.1f}, {hi:.1f}] dB")
         node.SetValue(gain_db)
 
-    def trigger(self, on_off: Literal["ON", "OFF"] = "ON", wait_ms: int = 10_000) -> None:
+    def trigger(self, on_off: Literal["ON", "OFF"] = "ON", wait_ms: int = 0) -> None:
         """Hardware trigger on Line0, rising edge, starting acquisition.
 
         wait_ms : how long a grab waits for the trigger before raising a timeout.

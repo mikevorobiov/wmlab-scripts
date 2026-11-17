@@ -8,6 +8,7 @@ Conventions
 - Frames are uint16 arrays indexed (y, x), i.e. (row, column), the camera's native
   order; sequences are (frame, y, x). imshow(frame) displays correctly, and
   frame[iy, ix] pairs with (y_mm[iy], x_mm[ix]).
+  Convert to float for any arithmetic, e.g. frame.astype(float) or frame / 65535.0.
 - Timestamps come from the camera's own clock (chunk data), in ns internally;
   sequences return them relative to the first frame, in microseconds.
 - Errors are raised, never printed and swallowed.

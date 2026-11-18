@@ -21,6 +21,12 @@ Usage
         frame = cam.get_frame()
         seq = cam.get_frame_sequence(100)
         meta = cam.get_metadata()       # pass straight into provenance.stamp()
+
+Triggered acquisition (pulse on Line0 starts the stream)
+    cam.trigger("ON")
+    cam.arm()                               # camera now waits for the edge
+    sigen.fire()                            # the pulse
+    seq = cam.collect(200)
 """
 
 from __future__ import annotations
@@ -45,7 +51,42 @@ def describe_image_status(status: int) -> str:
     except Exception:
         return f"status {status}"
 
+
+def warn_if_gaps(time_us: NDArray) -> None:
+    """Warn if any interval between frames is much longer than the typical one.
+
+    A frame lost in transit (or replaced after damage) never shows up as an
+    error by itself: the only trace is a longer gap in the camera timestamps.
+    For a synchronized sweep that gap shifts every later frame's sweep value.
+    """
+    if len(time_us) < 3:
+        return
+    intervals = np.diff(time_us)
+    typical = np.median(intervals)
+    long_gaps = np.nonzero(intervals > 1.5 * typical)[0]
+    if len(long_gaps) > 0:
+        print(f"warning: {len(long_gaps)} gap(s) longer than 1.5 x the typical "
+              f"{typical:.0f} us frame interval, after frames {long_gaps.tolist()}")
+
+
+def warn_if_large(num_frames: int, width: int, height: int) -> None:
+    """Warn if the frame array for a sequence would exceed MEMORY_WARNING_GB.
+
+    The whole sequence is held in memory as uint16 (2 bytes per pixel), so a
+    long full-frame run can exhaust RAM or push the computer into swapping.
+    """
+    size_gb = num_frames * width * height * 2 / 1e9
+    if size_gb > MEMORY_WARNING_GB:
+        print(f"warning: {num_frames} frames of {width} x {height} need "
+              f"{size_gb:.1f} GB of memory (warning limit {MEMORY_WARNING_GB} GB)")
+
+
 BLACK_LEVEL_PERCENT = 2.0     # fixed offset; high enough that dark noise is not clipped at 0
+MEMORY_WARNING_GB = 1.0       # warn when a sequence needs more memory than this
+
+# Frames the driver can hold between arm() and collect(). Each 720 x 540 Mono16
+# frame takes 0.78 MB, so 100 buffers are about 80 MB of host memory.
+STREAM_BUFFERS = 100
 
 class FLIRCamera:
     """FLIR camera (Spinnaker / PySpin) for single-frame and sequence acquisition.
@@ -70,6 +111,7 @@ class FLIRCamera:
         self._cam_index = cam_index
         self._fov_horizontal = fov_horizontal
         self._trigger_wait_ms = 0
+        self._temperature_before = float("nan")   # set by arm(), reported by collect()
         self._cam = None
         self._cam_list = None
 
@@ -122,6 +164,23 @@ class FLIRCamera:
         cam.ChunkSelector.SetValue(PySpin.ChunkSelector_Timestamp)
         cam.ChunkEnable.SetValue(True)
         self.set_fixed_black_level(BLACK_LEVEL_PERCENT)
+        self.set_stream_buffers(STREAM_BUFFERS)
+
+    def set_stream_buffers(self, count: int) -> None:
+        """Keep every frame, oldest first, in `count` host buffers.
+
+        Frames that arrive between arm() and collect() wait here instead of
+        being thrown away. Only valid while not streaming.
+        """
+        stream = self._cam.TLStream
+        stream.StreamBufferHandlingMode.SetValue(PySpin.StreamBufferHandlingMode_OldestFirst)
+        stream.StreamBufferCountMode.SetValue(PySpin.StreamBufferCountMode_Manual)
+
+        largest = stream.StreamBufferCountManual.GetMax()
+        if count > largest:
+            print(f"warning: {count} stream buffers requested, camera allows {largest}")
+            count = largest
+        stream.StreamBufferCountManual.SetValue(count)
 
     def set_fixed_black_level(self, percent: float) -> None:
         """Turn off automatic black-level clamping and set a fixed offset.
@@ -345,8 +404,38 @@ class FLIRCamera:
                            timeout_ms: int | None = None,
                            progress=None,
                            max_dropped: int = 0) -> dict:
-        """Acquire num_frames frames in one stream.
+        """Acquire num_frames frames in one stream: arm() and collect() in one call.
 
+        Use it when nothing has to happen between starting the stream and
+        reading it. With the trigger on, it waits for the pulse like collect().
+        Arguments and the returned dict are described in collect().
+        """
+        # Check first, so a bad argument never starts the stream.
+        if num_frames < 1:
+            raise ValueError("num_frames must be >= 1")
+        self.arm()
+        return self.collect(num_frames, timeout_ms=timeout_ms,
+                            progress=progress, max_dropped=max_dropped)
+
+    def arm(self) -> None:
+        """Start the stream and return immediately.
+
+        With the trigger on, the camera now waits for the pulse on Line0;
+        with the trigger off it starts taking frames at once. Frames wait in
+        the host buffers (STREAM_BUFFERS of them) until collect() reads them.
+        """
+        # Read the temperature before streaming starts: no effect on timing.
+        self._temperature_before = self.temperature_c
+        self._begin()
+
+    def collect(self, num_frames: int,
+                timeout_ms: int | None = None,
+                progress=None,
+                max_dropped: int = 0) -> dict:
+        """Read num_frames frames from the stream started by arm(), then stop the stream.
+
+        timeout_ms  : per-frame wait; the default includes the trigger wait,
+                      so the first frame can wait for the pulse.
         progress    : optional function called after every frame as
                       progress(frames_done, num_frames), e.g. to draw a progress bar.
                       Keep it quick: it runs between frames.
@@ -354,30 +443,34 @@ class FLIRCamera:
                       replaced by the next frame in the stream. The default 0
                       raises at the first one. Allow a few for stacks of
                       equivalent frames (flats, darks). Keep 0 when every frame
-                      matters, e.g. a time series.
+                      matters, e.g. a time series or a synchronized sweep.
 
         Returns dict with
             images  : uint16 (frame, y, x)
             time_us : float64, camera timestamps relative to the first frame
-                      (a replaced frame shows up as a longer gap)
+                      (a replaced or lost frame shows up as a longer gap)
             dropped : number of damaged frames that were replaced
             x_mm, y_mm : pixel coordinates
             temperature_before_c : camera temperature before acquisition
             temperature_after_c : camera temperature after acquisition
         """
+        if not self._cam.IsStreaming():
+            raise RuntimeError("collect() needs a running stream: call arm() first")
         if num_frames < 1:
+            self._end()          # do not leave the camera streaming
             raise ValueError("num_frames must be >= 1")
-        w, h = self.resolution
-        images = np.empty((num_frames, h, w), dtype=np.uint16)
+
+        width, height = self.resolution
+        warn_if_large(num_frames, width, height)
+        images = np.empty((num_frames, height, width), dtype=np.uint16)
         t_ns = np.empty(num_frames, dtype=np.int64)
 
         collected = 0
         dropped = 0
-        temperature_before = self.temperature_c
-        self._begin()
         try:
             while collected < num_frames:
                 try:
+                    # Frames are written straight into the array: no extra copy.
                     _, t_ns[collected] = self._grab(timeout_ms, out=images[collected])
                 except IncompleteImage:
                     # Damaged frame: count it, and grab the next one in its place.
@@ -390,16 +483,19 @@ class FLIRCamera:
                 if progress is not None:
                     progress(collected, num_frames)
         finally:
-            self._end()
+            self._end()      # stops the stream; frames still in flight are discarded
         temperature_after = self.temperature_c
+
+        time_us = (t_ns - t_ns[0]) / 1e3
+        warn_if_gaps(time_us)
 
         return {
             "images": images,
-            "time_us": (t_ns - t_ns[0]) / 1e3,
+            "time_us": time_us,
             "dropped": dropped,
             "x_mm": self.x_mm,
             "y_mm": self.y_mm,
-            "temperature_before_c": temperature_before,
+            "temperature_before_c": self._temperature_before,
             "temperature_after_c": temperature_after,
         }
 
